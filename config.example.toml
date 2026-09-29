@@ -20,6 +20,10 @@ model = "GLM-5.1"
 client = "cli"
 project = "global"
 user_agent = "deveco/0.2.0"
+# token 保活刷新间隔（小时），0 = 关闭；到期会自动用 jwtToken 换取新 access_token
+keepalive_hours = 6
+# 流式响应对这些模型剥离思维链（上游会把它们的 think 内容裸写进正文）；非流式自动检测
+thinking_models = ["GLM-5.3"]
 
 [deveco.auth]
 # 登录成功后由程序自动写入，无需手动填写

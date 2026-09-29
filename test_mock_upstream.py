@@ -7,6 +7,10 @@
 2. 工具调用字段（tool_calls / tool_call_id / tools）不再被截断
 3. access_token 失效时自动用 jwtToken 刷新并重试（401 → refresh → retry）
 4. 流式 / 非流式转发、请求头（lang、Chat-Id、x-deveco-*）、/v1/models 解析
+5. 思维链剥离：GLM-5.3（含 </think> 跨 chunk）转入 reasoning_content；
+   未思考/截断整段按正文兜底；非思考模型不受影响
+6. 上游忙/报错统一转译（HTTP 4xx + error 对象、200 + 空 data: 帧 + error 帧、
+   200 + error 对象）→ 规范 HTTP 429，空帧被跳过
 
 用法：.venv/bin/python test_mock_upstream.py
 """
@@ -16,6 +20,7 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,6 +38,9 @@ NEW_TOKEN = "new-token"
 STATE = {
     "old_valid": True,      # OLD_TOKEN 初始有效；调用前置 False 触发 401 刷新路径
     "omit_success": False,  # modelConfig 响应是否省略 success 字段
+    "s53_think": True,      # GLM-5.3 流式是否输出思维链（False 模拟未思考/截断）
+    "rl_stream": False,     # 流式返回上游限流形态（空 data: 帧 + error 帧）
+    "rl_nostream": None,    # 非流式限流形态：None / "soft"（200+error 对象）/ "hard"（HTTP 429+error）
 }
 REQS: list[dict] = []
 
@@ -53,7 +61,15 @@ MODEL_CONFIG = {
                         "output": 8192,
                         "thinking_mode": "on",
                         "tool_call_mode": "tool_calls",
-                    }
+                    },
+                    {
+                        "id": 2,
+                        "model_id": "GLM-5.3",
+                        "context_window": 32768,
+                        "output": 8192,
+                        "thinking_mode": "on",
+                        "tool_call_mode": "tool_calls",
+                    },
                 ],
                 "task_default_model_map": {"blacklist": ""},
             }
@@ -64,6 +80,12 @@ MODEL_CONFIG = {
 
 class MockUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"  # SSE 用连接关闭定界
+
+    RATE_LIMIT_ERROR = {
+        "message": "New session request rate exceeded. Please retry later or set up a custom model.",
+        "type": "UserSessionLimitExceeded",
+        "code": "403",
+    }
 
     def log_message(self, *args):  # 静默
         pass
@@ -90,20 +112,40 @@ class MockUpstream(BaseHTTPRequestHandler):
         token = auth[len("Bearer "):] if auth.startswith("Bearer ") else auth
         return token == "valid-tok" or token == NEW_TOKEN or (token == OLD_TOKEN and STATE["old_valid"])
 
-    def _sse(self) -> None:
+    def _sse(self, model: str = "") -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
-        chunks = [
-            {"id": "c1", "object": "chat.completion.chunk",
-             "choices": [{"index": 0, "delta": {"role": "assistant", "content": "po"}, "finish_reason": None}]},
-            {"id": "c1", "object": "chat.completion.chunk",
-             "choices": [{"index": 0, "delta": {"content": "ng"}, "finish_reason": "stop"}]},
-        ]
-        for ch in chunks:
+        self.wfile.write(b"data: \n\n")  # 上游偶发空帧：代理必须跳过
+        if model == "GLM-5.3" and STATE["s53_think"]:
+            # 思考模型形态：思维链裸写进正文，且 </think> 被拆到两个 chunk
+            parts = ["Let me think", " about it", " carefully.</thi", "nk>", "42"]
+        else:
+            parts = ["po", "ng"]
+        for i, part in enumerate(parts):
+            delta = {"role": "assistant", "content": part} if i == 0 else {"content": part}
+            ch = {
+                "id": "c1",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": "stop" if i == len(parts) - 1 else None,
+                    }
+                ],
+            }
             self.wfile.write(("data: %s\n\n" % json.dumps(ch)).encode())
             self.wfile.flush()
         self.wfile.write(b"data: [DONE]\n\n")
+
+    def _sse_rate_limit(self) -> None:
+        """上游限流形态：HTTP 200 + 空 data: 帧 + error 帧，无 [DONE]。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(b"data: \n\n")
+        self.wfile.write(("data: %s\n\n" % json.dumps({"error": dict(self.RATE_LIMIT_ERROR)})).encode())
 
     # ---- routes ----
     def do_GET(self):  # noqa: N802
@@ -140,10 +182,21 @@ class MockUpstream(BaseHTTPRequestHandler):
             if not self._token_ok():
                 self._json(401, {"error": "token expired"})
                 return
+            if STATE["rl_nostream"] == "soft":
+                self._json(200, {"error": dict(self.RATE_LIMIT_ERROR)})
+                return
+            if STATE["rl_nostream"] == "hard":
+                self._json(429, {"error": dict(self.RATE_LIMIT_ERROR)})
+                return
+            content = (
+                "Let me think about it carefully.</think>42"
+                if body.get("model") == "GLM-5.3"
+                else "pong"
+            )
             self._json(200, {
                 "id": "c1",
                 "object": "chat.completion",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             })
         elif self.path == "/sse/codeGenie/maas/v2/chat/completions":
@@ -151,7 +204,10 @@ class MockUpstream(BaseHTTPRequestHandler):
             if not self._token_ok():
                 self._json(401, {"error": "token expired"})
                 return
-            self._sse()
+            if STATE["rl_stream"]:
+                self._sse_rate_limit()
+                return
+            self._sse(body.get("model", ""))
         else:
             self._json(404, {"error": "not found"})
 
@@ -187,7 +243,7 @@ def main() -> int:
         r = client.get("/v1/models", headers=hdr)
         assert r.status_code == 200, r.text
         ids = [m["id"] for m in r.json()["data"]]
-        assert "GLM-5.1" in ids, ids
+        assert "GLM-5.1" in ids and "GLM-5.3" in ids, ids
         print(f"[+] /v1/models -> {ids}")
 
         # 无 key 拒绝
@@ -235,6 +291,7 @@ def main() -> int:
         assert r.status_code == 200, r.text
         text = r.text
         assert "data: [DONE]" in text, text[:300]
+        assert "reasoning_content" not in text, "非思考模型不应有 reasoning_content"
         content = ""
         for line in text.splitlines():
             if line.startswith("data: ") and line[6:] != "[DONE]":
@@ -242,12 +299,106 @@ def main() -> int:
         assert content == "pong", content
         stream_reqs = [q for q in REQS if q["kind"] == "chat_stream"]
         assert len(stream_reqs) == 1 and stream_reqs[0]["auth"] == f"Bearer {NEW_TOKEN}"
-        print("[+] 流式：SSE 透传 + [DONE]，内容拼装正确")
+        print("[+] 流式：SSE 透传 + [DONE]（上游空帧已剔除），内容拼装正确")
 
         # 运行期刷新后的 token 已写回配置文件
         cfg_text = (tmpdir / "config.toml").read_text(encoding="utf-8")
         assert NEW_TOKEN in cfg_text, "刷新后的 access_token 应写回 config.toml"
         print("[+] 刷新后的 access_token 已写回配置文件")
+
+        # ---- 3) /v1/models 自动刷新（失效 token → 200+errorCode → 刷新 → 重试） ----
+        config.deveco.auth.access_token = OLD_TOKEN  # 人为把内存 token 置回已失效值
+        before = len([q for q in REQS if q["kind"] == "modelConfig"])
+        r = client.get("/v1/models", headers=hdr)
+        assert r.status_code == 200, r.text
+        assert "GLM-5.1" in [m["id"] for m in r.json()["data"]]
+        mc = [q for q in REQS if q["kind"] == "modelConfig"][before:]
+        assert len(mc) == 2, f"应为 失败+重试 两次，实际 {len(mc)}"
+        assert mc[0]["auth"] == f"Bearer {OLD_TOKEN}" and mc[1]["auth"] == f"Bearer {NEW_TOKEN}"
+        print("[+] /v1/models：失效 token（200+errorCode）→ 自动刷新 → 重试成功")
+
+        # ---- 4) 思维链剥离：GLM-5.3（流式 + 非流式） ----
+        think = "Let me think about it carefully."
+
+        r = client.post("/v1/chat/completions", headers=hdr,
+                        json={"model": "GLM-5.3", "messages": [{"role": "user", "content": "1+1?"}]})
+        assert r.status_code == 200, r.text
+        msg = r.json()["choices"][0]["message"]
+        assert msg["content"] == "42", msg
+        assert msg["reasoning_content"] == think, msg
+        print("[+] 非流式 GLM-5.3：思维链 → reasoning_content，正文 = '42'")
+
+        def _stream_parts(model: str) -> tuple[str, str]:
+            resp = client.post("/v1/chat/completions", headers=hdr,
+                               json={"model": model, "stream": True,
+                                     "messages": [{"role": "user", "content": "1+1?"}]})
+            assert resp.status_code == 200, resp.text
+            got_content, got_reasoning = "", ""
+            for line in resp.text.splitlines():
+                if line.startswith("data: ") and line[6:] != "[DONE]":
+                    delta = json.loads(line[6:])["choices"][0]["delta"]
+                    got_content += delta.get("content", "")
+                    got_reasoning += delta.get("reasoning_content", "")
+            return got_content, got_reasoning
+
+        content, reasoning = _stream_parts("GLM-5.3")
+        assert content == "42", content          # </think> 跨 chunk 也不泄漏
+        assert reasoning == think, reasoning
+        print("[+] 流式 GLM-5.3：</think> 跨 chunk，思维链转入 reasoning_content，正文 = '42'")
+
+        STATE["s53_think"] = False  # 模拟模型未思考/被截断：整段按正文兜底
+        content, reasoning = _stream_parts("GLM-5.3")
+        assert content == "pong" and reasoning == "", (content, reasoning)
+        STATE["s53_think"] = True
+        print("[+] 流式 GLM-5.3 无 </think>：整段按正文兜底，不丢内容")
+
+        content, reasoning = _stream_parts("GLM-5.1")
+        assert content == "pong" and reasoning == "", (content, reasoning)
+        print("[+] 流式 GLM-5.1：不受影响，无 reasoning_content")
+
+        # ---- 5) 上游限流/错误 → 规范 429（三种姿势） ----
+        STATE["rl_stream"] = True
+        resp = client.post("/v1/chat/completions", headers=hdr,
+                           json={"model": "GLM-5.1", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+        assert resp.status_code == 429, resp.text
+        err = resp.json()["error"]
+        assert err["type"] == "UserSessionLimitExceeded", err
+        assert err["message"].startswith("New session request rate exceeded"), err
+        STATE["rl_stream"] = False
+        print("[+] 流式上游限流帧（200 + 空帧 + error 帧）→ HTTP 429 + 原始 error 信息")
+
+        STATE["rl_nostream"] = "hard"  # 上游 HTTP 4xx + error 对象（实测形态）
+        resp = client.post("/v1/chat/completions", headers=hdr,
+                           json={"model": "GLM-5.1", "messages": [{"role": "user", "content": "hi"}]})
+        assert resp.status_code == 429, resp.text
+        assert resp.json()["error"]["type"] == "UserSessionLimitExceeded", resp.text
+        STATE["rl_nostream"] = "soft"  # 上游 200 + error 对象（防御形态）
+        resp = client.post("/v1/chat/completions", headers=hdr,
+                           json={"model": "GLM-5.1", "messages": [{"role": "user", "content": "hi"}]})
+        assert resp.status_code == 429, resp.text
+        assert resp.json()["error"]["type"] == "UserSessionLimitExceeded", resp.text
+        STATE["rl_nostream"] = None
+        print("[+] 非流式上游错误（HTTP 4xx / 200+error 对象）→ HTTP 429")
+
+    # ---- 6) token 保活：keepalive_hours 定时循环自动刷新 ----
+    cfg2 = Config()
+    cfg2.server.api_key = API_KEY
+    cfg2.deveco.base_url = base
+    cfg2.deveco.keepalive_hours = 0.0005  # ≈1.8s，便于实测
+    cfg2.deveco.auth = DevEcoAuthConfig(jwt_token="jwt-1", access_token=NEW_TOKEN)
+    tmpdir2 = Path(tempfile.mkdtemp(prefix="deveco2api-keepalive-"))
+    app2 = create_app(cfg2, str(tmpdir2 / "config.toml"))
+    n0 = len([q for q in REQS if q["kind"] == "refresh"])
+    with TestClient(app2) as client2:
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if len([q for q in REQS if q["kind"] == "refresh"]) - n0 >= 2:
+                break
+            time.sleep(0.4)
+            client2.get("/health")
+    n1 = len([q for q in REQS if q["kind"] == "refresh"])
+    assert n1 - n0 >= 2, f"保活应至少触发 2 次刷新（间隔 ≈1.8s），实际 {n1 - n0} 次"
+    print(f"[+] token 保活：{n1 - n0} 次定时刷新（keepalive_hours=0.0005）")
 
     print("\nALL PASS ✔")
     return 0

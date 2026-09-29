@@ -92,6 +92,71 @@ def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return normalized
 
 
+THINK_END = "</think>"
+
+
+def _sse_chunk(template: dict[str, Any], delta: dict[str, Any]) -> str:
+    """基于上游最近一个 chunk 的信封，合成一帧 OpenAI 格式 SSE。"""
+    chunk = {k: template[k] for k in ("id", "object", "created", "model") if k in template}
+    chunk.setdefault("object", "chat.completion.chunk")
+    chunk["choices"] = [{"index": 0, "delta": delta, "finish_reason": None}]
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+def _strip_thinking_nonstream(payload: dict[str, Any]) -> dict[str, Any]:
+    """非流式：content 中 </think> 之前是上游未剥离的思维链，拆到 reasoning_content。"""
+    for choice in payload.get("choices") or []:
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str) and THINK_END in content:
+            think, _, answer = content.partition(THINK_END)
+            message["content"] = answer.lstrip()
+            if think.strip():
+                message["reasoning_content"] = think
+    return payload
+
+
+def _extract_sse_error(text: str) -> Optional[dict[str, Any]]:
+    """上游偶尔用 HTTP 200 + SSE error 帧报错（如新会话限流）：摘出第一个 error 对象。"""
+    for line in text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        try:
+            obj = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("error"), dict):
+            return obj["error"]
+    return None
+
+
+def _upstream_error_status(err: dict[str, Any]) -> int:
+    """把上游 error 对象映射为 HTTP 状态码（限流→429，其余按 code，兜底 502）。"""
+    if err.get("type") == "UserSessionLimitExceeded":
+        return 429
+    try:
+        code = int(err.get("code", 0))
+    except (TypeError, ValueError):
+        code = 0
+    return code if 400 <= code <= 599 else 502
+
+
+def _extract_http_error(resp: httpx.Response) -> dict[str, Any]:
+    """从上游 HTTP 错误响应中取出 error 对象（取不到则兜底为 message）。"""
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            return err
+        msg = payload.get("errorMsg") or payload.get("message") or payload.get("detail")
+        if msg:
+            return {"message": str(msg), "code": str(resp.status_code)}
+    return {"message": f"Upstream HTTP {resp.status_code}: {resp.text[:300]}", "code": str(resp.status_code)}
+
+
 def _build_deveco_body(config: Config, request_body: dict[str, Any]) -> dict[str, Any]:
     model = request_body.get("model", config.deveco.model)
     messages = _normalize_messages(request_body.get("messages", []))
@@ -132,6 +197,8 @@ def _create_app(config: Config, config_path: str = "config.toml") -> FastAPI:
 
     # 复用异步 httpx 客户端，保持连接池
     client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+    # 串行化 token 刷新（保活定时器与请求 401 路径可能并发）
+    refresh_lock = asyncio.Lock()
 
     @app.on_event("shutdown")
     async def _close_client():
@@ -148,13 +215,36 @@ def _create_app(config: Config, config_path: str = "config.toml") -> FastAPI:
             "User-Agent": config.deveco.user_agent,
             "Accept": "*/*",
         }
-        try:
+        async def _fetch_model_config() -> dict:
             resp = await client.get(url, params=params, headers=headers)
             resp.raise_for_status()
-            data = resp.json()
+            return resp.json()
+
+        try:
+            data = await _fetch_model_config()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in (401, 403) or not await _try_refresh_token():
+                logger.error("获取模型列表失败: %s", e)
+                raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+            headers["Authorization"] = f"Bearer {config.deveco.auth.access_token}"
+            try:
+                data = await _fetch_model_config()
+            except httpx.HTTPError as e2:
+                logger.error("刷新后获取模型列表失败: %s", e2)
+                raise HTTPException(status_code=502, detail=f"Upstream error: {e2}")
         except httpx.HTTPError as e:
             logger.error("获取模型列表失败: %s", e)
             raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+
+        # token 失效时上游可能返回 200 + errorCode（不抛 HTTP 错误）：刷新后重试一次
+        if not (data.get("success") is True or data.get("code") == 200):
+            if await _try_refresh_token():
+                headers["Authorization"] = f"Bearer {config.deveco.auth.access_token}"
+                try:
+                    data = await _fetch_model_config()
+                except httpx.HTTPError as e2:
+                    logger.error("刷新后获取模型列表失败: %s", e2)
+                    raise HTTPException(status_code=502, detail=f"Upstream error: {e2}")
 
         models: list[dict[str, Any]] = []
         body = data.get("body", {})
@@ -178,32 +268,78 @@ def _create_app(config: Config, config_path: str = "config.toml") -> FastAPI:
         if not jwt_token:
             return False
         base_url = config.deveco.base_url.rstrip("/")
-        try:
-            data = await asyncio.to_thread(refresh_access_token_sync, base_url, jwt_token)
-            user_info = data["userInfo"]
-            config.deveco.auth.access_token = user_info.get("accessToken", "")
-            config.deveco.auth.refresh_token = user_info.get("refreshToken", "")
-            config.deveco.auth.user_id = user_info.get("userId", "")
-            config.deveco.auth.user_name = user_info.get("name", "")
-            save_config(config, config_path)
-            logger.info("access_token 运行时刷新成功")
-            return True
-        except Exception as e:
-            logger.error("运行时刷新 access_token 失败: %s", e)
-            return False
+        async with refresh_lock:
+            try:
+                data = await asyncio.to_thread(refresh_access_token_sync, base_url, jwt_token)
+                user_info = data["userInfo"]
+                config.deveco.auth.access_token = user_info.get("accessToken", "")
+                config.deveco.auth.refresh_token = user_info.get("refreshToken", "")
+                config.deveco.auth.user_id = user_info.get("userId", "")
+                config.deveco.auth.user_name = user_info.get("name", "")
+                save_config(config, config_path)
+                logger.info("access_token 刷新成功")
+                return True
+            except Exception as e:
+                logger.error("刷新 access_token 失败: %s", e)
+                return False
+
+    async def _token_keeper(interval_s: float) -> None:
+        """定时保活刷新（参考 workbuddy2api-panel 的 token keepalive）：
+        让 access_token 常新、会话保持活跃；失败时旧 token 仍然有效，下一轮自动重试。"""
+        fails = 0
+        while True:
+            await asyncio.sleep(interval_s)
+            if await _try_refresh_token():
+                fails = 0
+                logger.info("token 保活刷新成功")
+            else:
+                fails += 1
+                if fails >= 3:
+                    logger.error(
+                        "token 保活连续 %d 次失败，如持续失败请重新登录: python main.py --login", fails
+                    )
+                else:
+                    logger.warning("token 保活刷新失败（连续 %d 次）", fails)
+
+    @app.on_event("startup")
+    async def _start_token_keeper() -> None:
+        hours = float(config.deveco.keepalive_hours or 0)
+        if hours > 0:
+            asyncio.create_task(_token_keeper(hours * 3600))
+            logger.info("token 保活已启用：每 %s 小时自动刷新一次", hours)
+        else:
+            logger.info("token 保活未启用（deveco.keepalive_hours = 0）")
 
     async def _call_upstream(stream: bool, url: str, headers: dict[str, str], body: dict[str, Any], session_id_value: str):
+        # 思维链剥离：流式按配置的模型清单缓冲剥离；非流式自动检测（见 _strip_thinking_nonstream）
+        strip_thinking = str(body.get("model", "")) in (config.deveco.thinking_models or [])
+        # 上游报错姿势不一（HTTP 4xx/5xx + error 对象、200 + error 帧、200 + error 对象，如新会话限流）：
+        # 统一摘出 error 并转成规范错误响应；401 保留刷新 token 后重试的路径
+        upstream = await client.post(url, headers=headers, json=body)
+        if upstream.status_code != 200:
+            if upstream.status_code == 401:
+                upstream.raise_for_status()
+            err = _extract_http_error(upstream)
+            status = _upstream_error_status(err)
+            logger.warning("上游 HTTP %s: %s", status, err)
+            return JSONResponse(status_code=status, content={"error": err})
         if stream:
-            upstream = await client.post(url, headers=headers, json=body)
-            upstream.raise_for_status()
+            upstream_error = _extract_sse_error(upstream.text)
+            if upstream_error is not None:
+                status = _upstream_error_status(upstream_error)
+                logger.warning("上游流式错误 HTTP %s: %s", status, upstream_error)
+                return JSONResponse(status_code=status, content={"error": upstream_error})
             return StreamingResponse(
-                _stream_response(upstream, session_id_value),
+                _stream_response(upstream, session_id_value, strip_thinking),
                 media_type="text/event-stream",
             )
-        else:
-            upstream = await client.post(url, headers=headers, json=body)
-            upstream.raise_for_status()
-            return JSONResponse(content=upstream.json())
+        data = upstream.json()
+        if isinstance(data, dict) and "error" in data and "choices" not in data:
+            err = data["error"] if isinstance(data.get("error"), dict) else {"message": str(data.get("error"))}
+            status = _upstream_error_status(err)
+            logger.warning("上游错误 HTTP %s: %s", status, err)
+            return JSONResponse(status_code=status, content={"error": err})
+        return JSONResponse(content=_strip_thinking_nonstream(data))
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
@@ -269,29 +405,64 @@ def _create_app(config: Config, config_path: str = "config.toml") -> FastAPI:
 
 
 async def _stream_response(
-    upstream: httpx.Response, session_id_value: str
+    upstream: httpx.Response, session_id_value: str, strip_thinking: bool = False
 ) -> AsyncGenerator[str, None]:
+    """转发上游 SSE。
+
+    strip_thinking=True 时（思考模型），首个 </think> 之前的内容是上游未剥离的
+    思维链：先缓冲，边界出现后单帧下发 reasoning_content；流结束仍无边界
+    （模型未思考/被截断）则整段按正文兜底，宁可不剥离也不丢内容。
+    """
+    holding = strip_thinking
+    buf = ""
+    template: dict[str, Any] = {}
     try:
         async for line in upstream.aiter_lines():
             if not line:
                 continue
-            if line.startswith("data: "):
-                payload = line[6:]
-                if payload == "[DONE]":
-                    yield "data: [DONE]\n\n"
-                    continue
-                try:
-                    chunk = json.loads(payload)
-                    # 标准化为 OpenAI 格式
-                    if "choices" in chunk:
-                        for choice in chunk.get("choices", []):
-                            delta = choice.get("delta", {})
-                            if "role" not in delta:
-                                delta.setdefault("role", "assistant")
-                except json.JSONDecodeError:
-                    pass
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            if not payload:  # 上游偶发空 data: 帧（限流场景见过），直接跳过
+                continue
+            if payload == "[DONE]":
+                if holding and buf:
+                    yield _sse_chunk(template, {"content": buf})
+                yield "data: [DONE]\n\n"
+                continue
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
                 yield f"data: {payload}\n\n"
-            # 跳过 id: / event: 等非 data: 的 SSE 字段，保持 OpenAI 标准格式
+                continue
+            template = chunk
+
+            # 标准化为 OpenAI 格式
+            if "choices" in chunk:
+                for choice in chunk.get("choices", []):
+                    delta = choice.get("delta", {})
+                    if "role" not in delta:
+                        delta.setdefault("role", "assistant")
+
+            if holding and chunk.get("choices"):
+                # ponytail: 上游恒为单 choice，思维链剥离只处理第一个 choice
+                choice = chunk["choices"][0]
+                delta = choice.get("delta") or {}
+                content = delta.get("content") or ""
+                if content:
+                    buf += content
+                    if THINK_END in buf:
+                        think, _, rest = buf.partition(THINK_END)
+                        holding, buf = False, ""
+                        if think.strip():
+                            yield _sse_chunk(template, {"role": "assistant", "reasoning_content": think})
+                        delta["content"] = rest.lstrip()
+                    else:
+                        delta["content"] = ""  # 思维链阶段：内容暂存缓冲，仅透传结构帧保活
+                if holding and buf and choice.get("finish_reason"):
+                    yield _sse_chunk(template, {"content": buf})
+                    holding, buf = False, ""
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
     finally:
         await upstream.aclose()
 

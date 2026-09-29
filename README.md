@@ -30,6 +30,8 @@ callback_port = 10101
 model = "GLM-5.1"
 client = "cli"
 project = "global"
+keepalive_hours = 6
+thinking_models = ["GLM-5.3"]
 
 [logging]
 level = "INFO"
@@ -42,6 +44,8 @@ level = "INFO"
 | `deveco.callback_port` | 浏览器 OAuth 回调监听端口 |
 | `deveco.model` | 默认模型 |
 | `deveco.client` / `project` | 请求头 `x-deveco-client` / `x-deveco-project` |
+| `deveco.keepalive_hours` | token 保活刷新间隔（小时），0=关闭；默认 6 |
+| `deveco.thinking_models` | 流式响应对这些模型剥离思维链到 `reasoning_content`；非流式自动检测 |
 
 ## 使用示例
 

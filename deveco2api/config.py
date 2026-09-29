@@ -51,6 +51,8 @@ class DevEcoConfig:
     client: str = "cli"
     project: str = "global"
     user_agent: str = "deveco/0.2.0"
+    keepalive_hours: float = 6.0  # token 保活刷新间隔（小时），0=关闭
+    thinking_models: list[str] = field(default_factory=lambda: ["GLM-5.3"])  # 流式剥离思维链的模型
     auth: DevEcoAuthConfig = field(default_factory=DevEcoAuthConfig)
 
     @classmethod
@@ -73,6 +75,8 @@ class DevEcoConfig:
                 "user_agent",
                 "deveco/0.2.0",
             ),
+            keepalive_hours=float(data.get("keepalive_hours", 6.0)),
+            thinking_models=list(data.get("thinking_models", ["GLM-5.3"])),
             auth=DevEcoAuthConfig.from_dict(data.get("auth", {})),
         )
 
@@ -88,6 +92,8 @@ class DevEcoConfig:
             "client": self.client,
             "project": self.project,
             "user_agent": self.user_agent,
+            "keepalive_hours": self.keepalive_hours,
+            "thinking_models": self.thinking_models,
             "auth": self.auth.to_dict(),
         }
 
