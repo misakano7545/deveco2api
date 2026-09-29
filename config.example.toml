@@ -19,7 +19,7 @@ callback_port = 10101
 model = "GLM-5.1"
 client = "cli"
 project = "global"
-user_agent = "deveco/0.1.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+user_agent = "deveco/0.2.0"
 
 [deveco.auth]
 # 登录成功后由程序自动写入，无需手动填写

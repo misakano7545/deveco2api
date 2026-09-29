@@ -50,7 +50,7 @@ class DevEcoConfig:
     model: str = "GLM-5.1"
     client: str = "cli"
     project: str = "global"
-    user_agent: str = "deveco/0.1.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+    user_agent: str = "deveco/0.2.0"
     auth: DevEcoAuthConfig = field(default_factory=DevEcoAuthConfig)
 
     @classmethod
@@ -71,7 +71,7 @@ class DevEcoConfig:
             project=data.get("project", "global"),
             user_agent=data.get(
                 "user_agent",
-                "deveco/0.1.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+                "deveco/0.2.0",
             ),
             auth=DevEcoAuthConfig.from_dict(data.get("auth", {})),
         )

@@ -63,8 +63,6 @@ def _build_deveco_headers(config: Config, session_id_value: str, user_msg_id: st
         "User-Agent": config.deveco.user_agent,
         "lang": "en",
         "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Connection": "keep-alive",
     }
     return headers
 
@@ -85,7 +83,12 @@ def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     elif part.get("type") == "image_url":
                         parts.append(f"[image: {part.get('image_url', {}).get('url', '')}]")
             content = "\n".join(parts)
-        normalized.append({"role": role, "content": content})
+        item: dict[str, Any] = {"role": role, "content": content}
+        # 保留工具/函数调用字段，否则多轮工具对话会被截断
+        for key in ("name", "tool_calls", "tool_call_id", "function_call"):
+            if key in m:
+                item[key] = m[key]
+        normalized.append(item)
     return normalized
 
 
@@ -138,14 +141,12 @@ def _create_app(config: Config, config_path: str = "config.toml") -> FastAPI:
     async def list_models(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)):
         _verify_api_key(config, credentials)
         url = f"{config.deveco.base_url.rstrip('/')}/codeGenie/modelConfig"
-        params = {"localVersion": "0", "pluginVersion": "CLI.0.1.0"}
+        params = {"localVersion": "0", "pluginVersion": "CLI.0.2.0"}
         headers = {
             "Authorization": f"Bearer {config.deveco.auth.access_token}",
             "Content-Type": "application/json",
-            "User-Agent": "opencode/0.1.0",
+            "User-Agent": config.deveco.user_agent,
             "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Connection": "keep-alive",
         }
         try:
             resp = await client.get(url, params=params, headers=headers)
@@ -176,6 +177,7 @@ def _create_app(config: Config, config_path: str = "config.toml") -> FastAPI:
         jwt_token = config.deveco.auth.jwt_token
         if not jwt_token:
             return False
+        base_url = config.deveco.base_url.rstrip("/")
         try:
             data = await asyncio.to_thread(refresh_access_token_sync, base_url, jwt_token)
             user_info = data["userInfo"]

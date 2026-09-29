@@ -65,6 +65,11 @@ def _parse_jwt(token: str) -> dict[str, Any]:
     return json.loads(payload_bytes.decode("utf-8"))
 
 
+def _is_real_name(user_info: dict[str, Any]) -> bool:
+    """华为账号实名状态；realName 字段可能是 bool 或字符串。"""
+    return str(user_info.get("realName", "")).strip().lower() == "true"
+
+
 # ---------------------------------------------------------------------------
 # 回调服务器
 # ---------------------------------------------------------------------------
@@ -206,6 +211,11 @@ def _check_jwt_token(base_url: str, jwt_token: str) -> dict[str, Any]:
         raise ValueError(f"校验 jwtToken 返回非 JSON: {resp['text']}")
     if not data.get("status") or not data.get("userInfo"):
         raise ValueError(f"jwtToken 校验未通过: {data}")
+    if not _is_real_name(data["userInfo"]):
+        logger.warning(
+            "账号实名认证状态为 false：内置模型可能无法调用，"
+            "请先用官方 DevEco Code 或浏览器完成华为账号实名后再试"
+        )
     return data
 
 
@@ -219,6 +229,8 @@ def _refresh_access_token(base_url: str, jwt_token: str) -> dict[str, Any]:
     data = resp["json"]
     if data is None or not data.get("status") or not data.get("userInfo"):
         raise ValueError(f"刷新 jwtToken 未通过: {data}")
+    if not _is_real_name(data["userInfo"]):
+        logger.warning("账号实名认证状态为 false：内置模型可能无法调用")
     return data
 
 
@@ -303,17 +315,24 @@ def save_login_result(config: Config, result: LoginResult, path: str = "config.t
 
 def _test_access_token(base_url: str, access_token: str) -> bool:
     url = f"{base_url}/codeGenie/modelConfig"
-    params = {"localVersion": "0", "pluginVersion": "CLI.0.1.0"}
+    params = {"localVersion": "0", "pluginVersion": "CLI.0.2.0"}
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
-        "User-Agent": "opencode/0.1.0",
+        "User-Agent": "deveco/0.2.0",
     }
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=10)
-        return resp.status_code == 200 and resp.json().get("success") is True
     except Exception:
         return False
+    if resp.status_code != 200:
+        return False
+    try:
+        data = resp.json()
+    except Exception:
+        return False
+    # 兼容旧响应 success:true 与当前官方 modelConfig 的 code==200 两种形态
+    return data.get("success") is True or data.get("code") == 200
 
 
 def ensure_auth(config: Config, config_path: str = "config.toml") -> str:
