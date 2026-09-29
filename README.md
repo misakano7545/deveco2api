@@ -69,9 +69,28 @@ curl -N http://127.0.0.1:10102/v1/chat/completions \
 uv run test_chat.py
 ```
 
+## 无头 / 远程服务器登录（login-relay）
+
+服务器上没有浏览器时（远程 VPS、无 VNC 的无头环境），用中继模式：
+本机同时启动「回调等待器 + 登录中继」，浏览器访问中继地址完成华为账号登录
+（收尾时发往 localhost 的回调会被中继转发回服务器），token 自动写入 config.toml。
+
+```bash
+# --tunnel：自动启动 cloudflared 快速隧道并打印外网地址（需已安装 cloudflared）
+uv run main.py --login-relay --tunnel
+
+# 无隧道 / 自行端口转发时（浏览器需能访问该地址）
+uv run main.py --login-relay --relay-port 8788
+```
+
+浏览器打开提示的地址（含口令参数 `?k=...`）完成登录，看到「全部完成」即可关闭页面。
+隧道创建失败时会自动退回仅本机模式（日志有提示），可稍后重试或自行做端口转发。
+可用参数：`--access-key`（固定口令）、`--timeout`（等待回调秒数，默认 600）。
+
 ## 命令行参数
 
 ```bash
 uv run main.py --port 10102 --no-browser
-uv run main.py --login          # 仅执行登录并保存 token
+uv run main.py --login            # 本机登录（浏览器与服务器同机时）
+uv run main.py --login-relay      # 无头/远程登录（中继模式，见上）
 ```

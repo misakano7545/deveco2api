@@ -33,6 +33,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, help="监听 port")
     parser.add_argument("--no-browser", action="store_true", help="登录时不自动打开浏览器")
     parser.add_argument("--login", action="store_true", help="仅执行登录并保存 token")
+    parser.add_argument("--login-relay", action="store_true", help="无头/远程登录：启动登录中继，浏览器（可经隧道）完成授权")
+    parser.add_argument("--relay-port", type=int, default=8788, help="登录中继监听端口（默认 8788）")
+    parser.add_argument("--access-key", default="", help="登录中继访问口令（默认随机生成并打印）")
+    parser.add_argument("--tunnel", action="store_true", help="自动启动 cloudflared 快速隧道并打印外网地址")
+    parser.add_argument("--timeout", type=int, default=600, help="等待浏览器回调超时秒数（默认 600）")
     return parser.parse_args(argv)
 
 
@@ -48,6 +53,19 @@ def main(argv: list[str] | None = None) -> int:
     # 让子日志器也继承同一级别
     for child in ("deveco2api.auth", "deveco2api.proxy"):
         logging.getLogger(child).setLevel(log_level)
+
+    if args.login_relay:
+        from deveco2api.login_relay import login_via_relay
+        try:
+            login_via_relay(
+                config, str(config_path),
+                relay_port=args.relay_port, access_key=args.access_key,
+                timeout_ms=args.timeout * 1000, tunnel=args.tunnel,
+            )
+        except Exception as e:
+            logger.error("登录失败: %s", e)
+            return 1
+        return 0
 
     if args.login:
         ensure_auth(config, str(config_path))

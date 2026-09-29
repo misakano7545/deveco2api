@@ -239,6 +239,38 @@ def refresh_access_token_sync(base_url: str, jwt_token: str) -> dict[str, Any]:
     return _refresh_access_token(base_url, jwt_token)
 
 
+def _finalize_login(config: Config, callback: dict[str, str]) -> LoginResult:
+    """登录回调的通用收尾：校验 → 换 token → 组装结果（本机登录与中继登录共用）。"""
+    base_url = config.deveco.base_url.rstrip("/")
+    app_id = config.deveco.app_id
+
+    if callback.get("quit") in ("true", "access_denied"):
+        raise RuntimeError("用户在浏览器中取消了授权")
+    if callback.get("siteId", "") != "1":
+        raise RuntimeError(f"不支持的 region，siteId={callback.get('siteId')}（目前只支持 siteId=1 中国区）")
+    temp_token = callback.get("tempToken", "").split("&")[0]
+    if not temp_token:
+        raise RuntimeError(f"回调缺少 tempToken: {callback}")
+
+    logger.info("收到回调，tempToken=%s...", temp_token[:24])
+    jwt_token = _exchange_temp_token(base_url, temp_token, app_id)
+    logger.info("获得 jwtToken: %s...", jwt_token[:64])
+
+    check_result = _check_jwt_token(base_url, jwt_token)
+    user_info = check_result["userInfo"]
+    jwt_payload = _parse_jwt(jwt_token)
+
+    return LoginResult(
+        jwt_token=jwt_token,
+        jwt_payload=jwt_payload,
+        user_info=user_info,
+        access_token=user_info.get("accessToken", ""),
+        refresh_token=user_info.get("refreshToken", ""),
+        user_id=user_info.get("userId", "") or jwt_payload.get("userId", ""),
+        user_name=user_info.get("name", "") or jwt_payload.get("userName", ""),
+    )
+
+
 def login_interactive(config: Config, timeout_ms: int = 600_000, no_browser: bool = False) -> LoginResult:
     """启动本地回调服务器，生成登录 URL，等待浏览器回调并换取 token。"""
     base_url = config.deveco.base_url.rstrip("/")
@@ -269,36 +301,7 @@ def login_interactive(config: Config, timeout_ms: int = 600_000, no_browser: boo
         except Exception:
             pass
 
-    if callback.get("quit") in ("true", "access_denied"):
-        raise RuntimeError("用户在浏览器中取消了授权")
-    if callback.get("siteId", "") != "1":
-        raise RuntimeError(f"不支持的 region，siteId={callback.get('siteId')}（目前只支持 siteId=1 中国区）")
-    temp_token = callback.get("tempToken", "").split("&")[0]
-    if not temp_token:
-        raise RuntimeError(f"回调缺少 tempToken: {callback}")
-
-    logger.info("收到回调，tempToken=%s...", temp_token[:24])
-    jwt_token = _exchange_temp_token(base_url, temp_token, app_id)
-    logger.info("获得 jwtToken: %s...", jwt_token[:64])
-
-    check_result = _check_jwt_token(base_url, jwt_token)
-    user_info = check_result["userInfo"]
-    jwt_payload = _parse_jwt(jwt_token)
-
-    access_token = user_info.get("accessToken", "")
-    refresh_token = user_info.get("refreshToken", "")
-    user_id = user_info.get("userId", "") or jwt_payload.get("userId", "")
-    user_name = user_info.get("name", "") or jwt_payload.get("userName", "")
-
-    return LoginResult(
-        jwt_token=jwt_token,
-        jwt_payload=jwt_payload,
-        user_info=user_info,
-        access_token=access_token,
-        refresh_token=refresh_token,
-        user_id=user_id,
-        user_name=user_name,
-    )
+    return _finalize_login(config, callback)
 
 
 def save_login_result(config: Config, result: LoginResult, path: str = "config.toml") -> None:
