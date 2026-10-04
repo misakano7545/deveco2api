@@ -287,6 +287,10 @@ def login_interactive(config: Config, timeout_ms: int = 600_000, no_browser: boo
 
     login_url = f"{base_url}/{config.deveco.auth_url}?port={actual_port}&appid={app_id}&code={client_secret}"
     logger.info("请在浏览器中完成华为账号授权：\n    %s", login_url)
+    logger.info(
+        "若浏览器与服务器不同机：先在本机执行 ssh -L %s:127.0.0.1:%s <user>@<服务器>，再打开上面的 URL（回调经隧道送回服务器）",
+        actual_port, actual_port,
+    )
     if not no_browser:
         try:
             webbrowser.open(login_url)

@@ -53,6 +53,12 @@ class DevEcoConfig:
     user_agent: str = "deveco/0.2.0"
     keepalive_hours: float = 6.0  # token 保活刷新间隔（小时），0=关闭
     thinking_models: list[str] = field(default_factory=lambda: ["GLM-5.3"])  # 流式剥离思维链的模型
+    # session_reuse: 客户端未带 session_id 时复用同一个上游会话。
+    # 实测：上游真正会拦的是「新建会话」——约 5 次/分就 429 (UserSessionLimitExceeded)，
+    # 而同一会话内连发 64 次（8 并发/17s）全 200；官方口径的 50 次/分是请求配额。
+    # True 把实际可用速率从 ~5 次/分提到上游请求配额量级；False 保持每请求新会话。
+    session_reuse: bool = False
+    session_ttl_minutes: int = 30  # 复用会话的轮换间隔（分钟）
     auth: DevEcoAuthConfig = field(default_factory=DevEcoAuthConfig)
 
     @classmethod
@@ -77,6 +83,8 @@ class DevEcoConfig:
             ),
             keepalive_hours=float(data.get("keepalive_hours", 6.0)),
             thinking_models=list(data.get("thinking_models", ["GLM-5.3"])),
+            session_reuse=bool(data.get("session_reuse", False)),
+            session_ttl_minutes=int(data.get("session_ttl_minutes", 30)),
             auth=DevEcoAuthConfig.from_dict(data.get("auth", {})),
         )
 
@@ -94,6 +102,8 @@ class DevEcoConfig:
             "user_agent": self.user_agent,
             "keepalive_hours": self.keepalive_hours,
             "thinking_models": self.thinking_models,
+            "session_reuse": self.session_reuse,
+            "session_ttl_minutes": self.session_ttl_minutes,
             "auth": self.auth.to_dict(),
         }
 

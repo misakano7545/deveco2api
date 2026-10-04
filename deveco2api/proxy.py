@@ -38,6 +38,38 @@ def _get_chat_id(session_id_value: str) -> str:
     return cache[session_id_value]
 
 
+def _sticky_session() -> dict[str, Any]:
+    # 复用中的上游会话（session_reuse 时用）：进程内单例，asyncio 单线程无需锁
+    if not hasattr(_sticky_session, "state"):
+        _sticky_session.state = {"id": "", "at": 0.0}
+    return _sticky_session.state
+
+
+def resolve_session_id(request_body: dict[str, Any], config: Config) -> str:
+    """决定本次请求用的上游会话。
+
+    客户端显式给了 session_id 就用它的；否则按 deveco.session_reuse 决定：
+    复用同一个会话（实测：上游真正会拦的是「新建会话」——约 5 次/分就 429
+    UserSessionLimitExceeded，而同一会话内连发 64 次全 200），还是每请求新开一个
+    （老行为，实际可用速率约 5 次/分）。
+    """
+    explicit = str(request_body.get("session_id") or "").strip()
+    if explicit:
+        return explicit
+    if not config.deveco.session_reuse:
+        return session_id()
+
+    ttl = float(config.deveco.session_ttl_minutes or 30) * 60.0
+    state = _sticky_session()
+    now = time.monotonic()
+    if not state["id"] or now - state["at"] >= ttl:
+        old = state["id"]
+        state["id"], state["at"] = session_id(), now
+        if old:
+            logger.info("复用会话轮换: %s → %s", old, state["id"])
+    return state["id"]
+
+
 def _verify_api_key(
     config: Config, credentials: Optional[HTTPAuthorizationCredentials]
 ) -> None:
@@ -353,7 +385,7 @@ def _create_app(config: Config, config_path: str = "config.toml") -> FastAPI:
             raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
         stream = request_body.get("stream", False)
-        session_id_value = request_body.get("session_id") or session_id()
+        session_id_value = resolve_session_id(request_body, config)
         user_msg_id = message_id()
 
         deveco_body = _build_deveco_body(config, request_body)

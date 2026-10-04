@@ -380,6 +380,35 @@ def main() -> int:
         STATE["rl_nostream"] = None
         print("[+] 非流式上游错误（HTTP 4xx / 200+error 对象）→ HTTP 429")
 
+        # ---- 7) 会话复用：session_reuse 开关（未带 session_id 时是否复用同一上游会话）----
+        # 实测：上游拦的是「新建会话」（约 5 次/分 429 UserSessionLimitExceeded），
+        # 同一会话内连发 64 次（8 并发/17s）全 200；官方 50 次/分是请求配额不是新会话配额。
+        # 所以未带 session_id 时复用同一会话是可用性的关键，显式 session_id 仍优先。
+        def _two_sids(with_explicit=None):
+            REQS.clear()
+            for sid in (with_explicit or [None, None]):
+                body = {"model": "GLM-5.1", "messages": [{"role": "user", "content": "hi"}]}
+                if sid:
+                    body["session_id"] = sid
+                r = client.post("/v1/chat/completions", headers=hdr, json=body)
+                assert r.status_code == 200, r.text
+            return [q["headers"].get("session-id") for q in REQS if q["kind"] == "chat_no_stream"]
+
+        config.deveco.session_reuse = False
+        sids = _two_sids()
+        assert len(sids) == 2 and sids[0] != sids[1], f"关闭复用时两次会话应不同: {sids}"
+        print("[+] session_reuse=false：每请求新会话（老行为，≈5 次/分就撞 429）")
+
+        config.deveco.session_reuse = True
+        sids = _two_sids()
+        assert len(sids) == 2 and sids[0] == sids[1], f"开启复用时两次会话应相同: {sids}"
+        print(f"[+] session_reuse=true：两次请求复用同一会话 {sids[0]}")
+
+        sids = _two_sids(["cli-a", "cli-b"])
+        assert sids == ["cli-a", "cli-b"], f"显式 session_id 应优先: {sids}"
+        print("[+] 显式 session_id 优先，复用开关不干扰会话隔离")
+        config.deveco.session_reuse = False
+
     # ---- 6) token 保活：keepalive_hours 定时循环自动刷新 ----
     cfg2 = Config()
     cfg2.server.api_key = API_KEY
@@ -399,6 +428,7 @@ def main() -> int:
     n1 = len([q for q in REQS if q["kind"] == "refresh"])
     assert n1 - n0 >= 2, f"保活应至少触发 2 次刷新（间隔 ≈1.8s），实际 {n1 - n0} 次"
     print(f"[+] token 保活：{n1 - n0} 次定时刷新（keepalive_hours=0.0005）")
+
 
     print("\nALL PASS ✔")
     return 0

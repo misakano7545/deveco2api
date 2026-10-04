@@ -24,6 +24,13 @@ user_agent = "deveco/0.2.0"
 keepalive_hours = 6
 # 流式响应对这些模型剥离思维链（上游会把它们的 think 内容裸写进正文）；非流式自动检测
 thinking_models = ["GLM-5.3"]
+# 客户端未带 session_id 时复用同一个上游会话。
+# 实测：上游拦的是「新建会话」（约 5 次/分就 429 UserSessionLimitExceeded），
+# 而同一会话内连发 64 次（8 并发/17s）全 200；官方 50 次/分是请求配额不是新会话配额。
+# true 把实际可用速率从 ~5 次/分提到上游请求配额量级。
+session_reuse = false
+# 复用会话的轮换间隔（分钟）
+session_ttl_minutes = 30
 
 [deveco.auth]
 # 登录成功后由程序自动写入，无需手动填写
