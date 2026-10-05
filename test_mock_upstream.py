@@ -409,6 +409,25 @@ def main() -> int:
         print("[+] 显式 session_id 优先，复用开关不干扰会话隔离")
         config.deveco.session_reuse = False
 
+        # ---- 8) 图片入站：vision_models 命中时 content 数组透传，其余模型降级为文本 ----
+        img_msg = [{"type": "text", "text": "这张图什么颜色"},
+                   {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}]
+
+        def _sent_content(model):
+            REQS.clear()
+            r = client.post("/v1/chat/completions", headers=hdr,
+                            json={"model": model, "messages": [{"role": "user", "content": img_msg}]})
+            assert r.status_code == 200, r.text
+            return [q for q in REQS if q["kind"] == "chat_no_stream"][-1]["body"]["messages"][0]["content"]
+
+        c = _sent_content("Qwen3_VL_235B_A22B_Instruct")
+        assert isinstance(c, list) and c[1]["type"] == "image_url", f"视觉模型应透传多模态数组: {c}"
+        print("[+] vision_models 命中：多模态 content 数组透传（Qwen3_VL_235B_A22B_Instruct）")
+
+        c = _sent_content("GLM-5.1")
+        assert isinstance(c, str) and "[image: data:image/png;base64," in c, f"非视觉模型应降级为文本: {c}"
+        print("[+] 非视觉模型：图片降级为 [image: url] 文本（GLM-5.1，实测带图上游 403）")
+
     # ---- 6) token 保活：keepalive_hours 定时循环自动刷新 ----
     cfg2 = Config()
     cfg2.server.api_key = API_KEY

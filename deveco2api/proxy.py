@@ -99,13 +99,18 @@ def _build_deveco_headers(config: Config, session_id_value: str, user_msg_id: st
     return headers
 
 
-def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """保留原始 messages，仅确保 content 为字符串。"""
+def _normalize_messages(messages: list[dict[str, Any]], keep_vision: bool = False) -> list[dict[str, Any]]:
+    """保留原始 messages；keep_vision=True 时多模态 content 数组原样透传。
+
+    实测：只有 Qwen3_VL_235B_A22B_Instruct 收图（OpenAI 的 image_url + data URL 形状），
+    GLM-5.1/5.3 带图直接 403 ModelServiceError。所以默认仍把图片降级为 "[image: url]" 文本，
+    只对 config.deveco.vision_models 命中的模型保留结构化 content。
+    """
     normalized: list[dict[str, Any]] = []
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
-        if isinstance(content, list):
+        if isinstance(content, list) and not keep_vision:
             # 简单将多模态内容拼接为文本；实际可按需扩展
             parts = []
             for part in content:
@@ -191,7 +196,8 @@ def _extract_http_error(resp: httpx.Response) -> dict[str, Any]:
 
 def _build_deveco_body(config: Config, request_body: dict[str, Any]) -> dict[str, Any]:
     model = request_body.get("model", config.deveco.model)
-    messages = _normalize_messages(request_body.get("messages", []))
+    keep_vision = model in (config.deveco.vision_models or [])
+    messages = _normalize_messages(request_body.get("messages", []), keep_vision)
     stream = request_body.get("stream", False)
     max_tokens = request_body.get("max_tokens", 32000)
 

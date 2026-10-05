@@ -59,6 +59,11 @@ class DevEcoConfig:
     # True 把实际可用速率从 ~5 次/分提到上游请求配额量级；False 保持每请求新会话。
     session_reuse: bool = False
     session_ttl_minutes: int = 30  # 复用会话的轮换间隔（分钟）
+    # vision_models: 这些模型收图，多模态 content 数组原样透传给上游。
+    # 实测（2026-10）：只有 Qwen3_VL_235B_A22B_Instruct 能吃 image_url（data URL 也行），
+    # 并把「红底白方块」认对；GLM-5.1/5.3 带图直接 403 ModelServiceError（同秒纯文字 200）。
+    # 其余模型仍把图片降级成 "[image: url]" 文本 —— 否则带图请求会一律 403。
+    vision_models: list[str] = field(default_factory=lambda: ["Qwen3_VL_235B_A22B_Instruct"])
     auth: DevEcoAuthConfig = field(default_factory=DevEcoAuthConfig)
 
     @classmethod
@@ -85,6 +90,7 @@ class DevEcoConfig:
             thinking_models=list(data.get("thinking_models", ["GLM-5.3"])),
             session_reuse=bool(data.get("session_reuse", False)),
             session_ttl_minutes=int(data.get("session_ttl_minutes", 30)),
+            vision_models=list(data.get("vision_models", ["Qwen3_VL_235B_A22B_Instruct"])),
             auth=DevEcoAuthConfig.from_dict(data.get("auth", {})),
         )
 
@@ -104,6 +110,7 @@ class DevEcoConfig:
             "thinking_models": self.thinking_models,
             "session_reuse": self.session_reuse,
             "session_ttl_minutes": self.session_ttl_minutes,
+            "vision_models": self.vision_models,
             "auth": self.auth.to_dict(),
         }
 

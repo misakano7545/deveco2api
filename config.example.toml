@@ -24,6 +24,11 @@ user_agent = "deveco/0.2.0"
 keepalive_hours = 6
 # 流式响应对这些模型剥离思维链（上游会把它们的 think 内容裸写进正文）；非流式自动检测
 thinking_models = ["GLM-5.3"]
+# 收图的模型：命中时多模态 content 数组原样透传给上游。
+# 实测（2026-10）：只有 Qwen3_VL_235B_A22B_Instruct 能吃 image_url（data URL 也行，
+# 红底白方块认对）；GLM-5.1/5.3 带图直接 403 ModelServiceError（同秒纯文字 200）。
+# 其余模型仍把图片降级成 "[image: url]" 文本，否则带图请求会一律 403。
+vision_models = ["Qwen3_VL_235B_A22B_Instruct"]
 # 客户端未带 session_id 时复用同一个上游会话。
 # 实测：上游拦的是「新建会话」（约 5 次/分就 429 UserSessionLimitExceeded），
 # 而同一会话内连发 64 次（8 并发/17s）全 200；官方 50 次/分是请求配额不是新会话配额。
